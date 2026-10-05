@@ -1,130 +1,76 @@
-# fleet-template-v1
+# gRPC (C++) template
 
-## What This Template Is
+Provisioned from [`Qode-Fleet-Control/fleet-template-v1`](https://github.com/Qode-Fleet-Control/fleet-template-v1) — the fleet
+lifecycle contract (`bin/`, `fleet.conf`, `compose.yaml`, deploy workflows) with a gRPC C++ starter laid on top.
 
-`fleet-template-v1` is a **language-agnostic app lifecycle harness** for apps
-managed by the fleet platform. It gives any app — Node, Python, Go, a Docker
-Compose stack, anything — a uniform way to be deployed and controlled, without
-the fleet needing to know a single thing about your stack.
+A gRPC server in C++ (gRPC 1.51 + Protobuf from Debian trixie), built with CMake, which generates the stubs from `protos/helloworld.proto` at build time. It serves `helloworld.Greeter/SayHello`, the standard `grpc.health.v1.Health` service, and server reflection (so `grpcurl` works without the .proto). It speaks gRPC (HTTP/2), not HTTP/1.1, so `HEALTH_PATH` is empty: the fleet's check is a TCP accept on `$PORT`, the same as `qode-grpc-go-template-v1`.
 
-The fleet injects runtime variables into the environment (`PORT`, `BASE_PATH`,
-`DATABASE_URL`) and calls `./bin/run` to deploy. Everything project-specific —
-how to install, build, and start your app — lives in **one file: `fleet.conf`**.
-That is the only file you edit per project.
+## Origin
 
-## Repository Structure
+    hand-written (gRPC ships no project generator) — the Greeter server and protos/helloworld.proto from gRPC's examples/cpp/helloworld; CMakeLists.txt does what that example's CMakeLists does (protoc + grpc_cpp_plugin custom command, a hw_grpc_proto library, find_package(gRPC CONFIG)) without its common.cmake
 
-```
-fleet.conf        ← the only file you edit per project
-.env              ← local-only env vars (gitignored)
-bin/
-  _common.sh      ← shared logic; never edit this
-  run             ← install + build + start (called by the fleet)
-  start           ← start only (no rebuild)
-  restart         ← stop + full run
-  reload          ← hot-reload config without rebuild
-  stop            ← stop the running process
-```
 
-## The One File You Edit: `fleet.conf`
+## Run it
 
-`fleet.conf` is sourced as shell by the lifecycle scripts. Fill in the commands
-for your stack; leave any command empty (`''`) to skip that step.
+### On the fleet
+
+The fleet runs it as containers (the docker runtime): `bin/run` builds the image with
+`docker compose build` and then starts it with `docker compose up` in the foreground, publishing `$PORT`.
+
+It listens on `0.0.0.0:$PORT` (default `8080`), read from the environment when the container starts,
+and serves at the root of its own hostname (`https://<hash>.<FLEET_APP_DOMAIN>/`). `HEALTH_PATH` is empty, so the health check is a TCP accept on `$PORT`.
+
+### With docker
 
 ```sh
-NAME="my-app"           # label shown in fleet logs
-PORT="3000"             # default port (fleet overrides via $PORT env var)
-HEALTH_PATH="/"         # HTTP path that returns 200 when the app is ready
-
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/server.js'   # must listen on $PORT; run in foreground
-RELOAD_CMD=''           # optional; empty → falls back to stop+start
+PORT=8080 bin/run                 # build + run through compose, Ctrl-C to stop
+docker compose up --build             # the same, by hand
+grpcurl -plaintext localhost:8080 list
+grpcurl -plaintext -d '{"name":"fleet"}' localhost:8080 helloworld.Greeter/SayHello
+grpcurl -plaintext localhost:8080 grpc.health.v1.Health/Check
 ```
 
-> **Critical rule:** single-quote any command that uses `$PORT` or
-> `$BASE_PATH`. Single quotes defer variable expansion to **runtime** — when the
-> command actually runs, with the fleet-injected value — rather than at the
-> moment `fleet.conf` is sourced (when those values aren't set yet). Use
-> `START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'`, never double quotes.
-
-## How the Lifecycle Works
-
-| Script | What it does | When to use |
-| --- | --- | --- |
-| `bin/run` | `INSTALL_CMD` → `BUILD_CMD` → `START_CMD` | Fleet deploy, fresh start |
-| `bin/start` | `START_CMD` only | Restart without rebuild |
-| `bin/restart` | stop + `bin/run` | After a code/dep change |
-| `bin/reload` | `RELOAD_CMD`, or stop+start if empty | After a config-only change |
-| `bin/stop` | Kill by pidfile or port | Tear down |
-
-> The process PID is written to `.fleet/app.pid` so subsequent `stop`/`restart`
-> calls can find and terminate it reliably. If the pidfile is missing or stale,
-> `stop` falls back to freeing whatever is listening on `$PORT`.
-
-## How to Apply This to Your Project
-
-### Step 1 — Copy the template into your repo
+### Without docker
 
 ```sh
-cp -r fleet-template-v1/* my-project/
+# Debian/Ubuntu: sudo apt install build-essential cmake pkg-config libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+PORT=8080 ./build/app
+# or: FLEET_RUNTIME=process PORT=8080 bin/run
 ```
 
-Or, if starting fresh, just clone it and work from `main`.
+`fleet.conf` drives every script in `bin/`:
 
-### Step 2 — Edit `fleet.conf` (the only required change)
+| step | docker runtime (fleet) | `FLEET_RUNTIME=process` |
+|---|---|---|
+| install | — | `(none)` |
+| build | `docker compose build` | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` |
+| start | `docker compose up --remove-orphans` | `env PORT="$PORT" ./build/app` |
 
-Fill in your stack's commands. Per-stack examples:
+## Layout
 
-```sh
-# Node.js
-INSTALL_CMD='npm ci'
-BUILD_CMD='npm run build'
-START_CMD='node dist/index.js'
+- `protos/helloworld.proto` — the service definition (verbatim from gRPC's examples).
+- `CMakeLists.txt` — generates `helloworld.pb.*` / `helloworld.grpc.pb.*` into the build tree, builds them as `hw_grpc_proto`, links the server `app` to it, `gRPC::grpc++` and `gRPC::grpc++_reflection`.
+- `src/greeter_server.cc` — the Greeter implementation, health + reflection enabled, listening on `0.0.0.0:$PORT`.
+- `Dockerfile` — `debian:trixie` build stage; `debian:trixie-slim` runtime with only `libgrpc++1.51t64` and `libprotobuf32t64`; non-root user `app`.
+- `compose.yaml` — service `app`, publishes `${PORT:-8080}:${PORT:-8080}`, fleet variables passed through by name.
 
-# Python (Gunicorn)
-INSTALL_CMD='pip install -r requirements.txt'
-BUILD_CMD=''
-START_CMD='gunicorn app:app --bind 0.0.0.0:$PORT'
+## Deviations from stock, and why
 
-# Go
-INSTALL_CMD=''
-BUILD_CMD='go build -o ./out/server ./cmd/server'
-START_CMD='./out/server'
+- The example takes `--port` (default 50051); this reads `$PORT` at runtime (default 8080, like the gRPC-Go template) and always binds `0.0.0.0`.
+- The example's CMakeLists includes `common.cmake` to support building gRPC as a submodule / via FetchContent; this uses the system gRPC only, which keeps the build to about a minute.
+- SIGINT/SIGTERM shut the server down cleanly (a watcher thread calls `Server::Shutdown()`), so `docker stop` / `bin/stop` do not wait for the kill timeout.
+- `HEALTH_PATH` is empty: there is no HTTP/1.1 path to probe. Use the gRPC health service for real readiness.
 
-# Docker Compose
-INSTALL_CMD=''
-BUILD_CMD='docker compose build'
-START_CMD='docker compose up'
-RELOAD_CMD='docker compose up -d --no-build'
-```
+## Verified
 
-### Step 3 — Set local env vars in `.env` (gitignored)
+2026-10-05, Docker 29.8 on linux/amd64:
 
-```sh
-APP_NAME=My App
-DATABASE_URL=postgres://localhost/mydb
-```
+- `verify.sh <dir> 46504` (the migrate-docker-runtime skill's end-to-end check; `HEALTH_PATH` is empty, so each probe is a TCP accept) → `run=tcp-up restart=tcp-up containers_after_stop=0`; the container logged `Server listening on 0.0.0.0:46504`.
+- `migrate.py audit <dir>` → `READY`.
 
-### Step 4 — Verify standalone
+Not verified: an actual RPC (`SayHello`, `grpc.health.v1.Health/Check`) — no gRPC client was available on the build host when this was cut. Run the `grpcurl` lines above once before relying on it.
 
-```sh
-PORT=3001 bin/run      # should install, build, and serve on 3001
-curl http://localhost:3001/   # should 200
-```
+The no-docker path (`FLEET_RUNTIME=process`) was not run on a host toolchain; it is the same CMake build the image runs.
 
-### Step 5 — Connect to the fleet
-
-Point the fleet at your repo. It will clone it, inject `PORT` / `BASE_PATH` /
-`DATABASE_URL`, and call `bin/run`. As long as your `START_CMD` listens on
-`$PORT` and `HEALTH_PATH` returns 200, the fleet will mark the app healthy.
-
-## Key Invariants
-
-- **`START_CMD` must run in the foreground and listen on `$PORT`.** Do not use a
-  dev server — HMR / hot-reload chunks 404 behind the ingress and will break the
-  app.
-- **Never put secrets in `fleet.conf`** — it's committed. Use `.env` locally;
-  the fleet injects secrets via the environment.
-- **`bin/_common.sh` is shared infrastructure** — don't edit it per project. All
-  project-specific configuration belongs in `fleet.conf`.
+See `docs/fleet-lifecycle.md` for the lifecycle contract.
